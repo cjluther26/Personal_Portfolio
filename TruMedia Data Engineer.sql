@@ -412,3 +412,201 @@ ORDER BY league, division_order, W DESC
 
 /* 6. Show off your creativity and SQL expertise by writing one or more additional queries that
 combine the data in these tables. */
+
+  /* 
+     Top 20 players with the highest OPS against
+     non-divisional opponents in a single season,
+     between 2022 and 2023 (minimum 100 PA in such games).
+  */
+
+  WITH player_team_games AS (
+    SELECT 
+      pg.player_id 
+    , pg.team_id
+    , pg.PA
+    , pg.AB  
+    , pg.H 
+    , pg.S 
+    , pg.D 
+    , pg.T 
+    , pg.HR 
+    , pg.BB 
+    , pg.HBP
+    , pg.SF
+    , g.season 
+    , g.date 
+    , g.home_team_id 
+    , home_teams.league AS home_league
+    , home_teams.division AS home_division
+    , g.away_team_id 
+    , away_teams.league AS away_league
+    , away_teams.division AS away_division
+    , ROW_NUMBER() OVER(PARTITION BY pg.player_id, g.season ORDER BY g.date DESC) AS r_desc
+    FROM mlb_data.player_games pg
+    INNER JOIN mlb_data.games g
+      ON 1=1 
+         AND pg.game_pk = g.game_pk 
+         AND g.season BETWEEN 2022 AND 2023
+    LEFT JOIN mlb_data.teams home_teams 
+      ON g.home_team_id = home_teams.id
+    LEFT JOIN mlb_data.teams away_teams 
+      ON g.away_team_id = away_teams.id
+) 
+
+-- SELECT * FROM player_team_games ORDER BY date DESC LIMIT 100
+
+, player_team_eos AS (
+    SELECT 
+      player_id 
+    , season
+    , team_id 
+    FROM player_team_games
+    WHERE 1=1
+          AND r_desc = 1
+)
+
+, non_div_stats_prep AS (
+  SELECT 
+    player_id 
+  , season 
+  , SUM(PA) AS total_PA
+  , SUM(H + BB + HBP) / SUM(AB + BB + HBP + SF) AS OBP
+  , SUM(S + (2 * D) + (3 * T) + (4 * HR)) / (SUM(AB)) AS SLG
+  FROM player_team_games
+  WHERE 1=1
+        AND (
+             home_league <> away_league 
+          OR (home_league = away_league AND home_division <> away_division)
+        )
+  GROUP BY 1,2
+  HAVING SUM(PA) >= 100
+)
+
+-- SELECT * FROM non_div_stats_prep
+
+, non_div_top_20 AS (
+  SELECT 
+    ndsp.season 
+  , ndsp.player_id 
+  , p.name 
+  , t.abbrev 
+  , t.name AS team_name
+  , ndsp.total_PA
+  , ndsp.OBP
+  , ndsp.SLG
+  , ndsp.OBP + ndsp.SLG AS OPS
+  FROM non_div_stats_prep ndsp
+    LEFT JOIN mlb_data.players p 
+        ON ndsp.player_id = p.id
+    LEFT JOIN player_team_eos t_eos 
+        ON ndsp.season = t_eos.season AND ndsp.player_id = t_eos.player_id
+    LEFT JOIN mlb_data.teams t 
+        ON t_eos.team_id = t.id
+  ORDER BY OPS DESC
+  LIMIT 20
+)
+
+SELECT * FROM non_div_top_20
+;
+
+
+
+/* 
+     The player with the highest share of a team's total HRs within a season, 
+     split by day of week (DoW) and season
+     between 2022 and 2023
+
+*/
+
+WITH player_dow_hrs AS (
+  SELECT 
+    g.season 
+  , DAYOFWEEK(g.date) AS dow_int
+  , DAYNAME(g.date) AS dow
+  , pg.team_id 
+  , pg.player_id
+  , SUM(pg.HR) AS HR
+  FROM mlb_data.player_games pg
+  INNER JOIN mlb_data.games g
+      ON pg.game_pk = g.game_pk AND g.season BETWEEN 2022 AND 2023
+  GROUP BY 1,2,3,4,5
+)
+
+-- SELECT * FROM player_dow_hrs LIMIT 10
+
+, team_dow_hrs AS (
+  SELECT 
+    g.season 
+  , DAYNAME(g.date) AS dow
+  , tg.team_id 
+  , SUM(tg.HR) AS team_HR
+  FROM mlb_data.team_games tg
+  INNER JOIN mlb_data.games g
+      ON tg.game_pk = g.game_pk AND g.season BETWEEN 2022 AND 2023
+  GROUP BY 1,2,3
+)
+
+-- SELECT * FROM team_dow_hrs
+
+, joined_data AS (
+  SELECT 
+    p.*
+  , t.team_HR
+  FROM player_dow_hrs p 
+  LEFT JOIN team_dow_hrs t 
+    ON 1=1
+       AND p.season = t.season
+       AND p.dow = t.dow
+       AND p.team_id = t.team_id
+)
+
+-- SELECT * FROM joined_data WHERE player_id = '572233' ORDER BY HR DESC
+
+, final_data_prep AS (
+  SELECT 
+    season 
+  , dow 
+  , dow_int
+  , team_id 
+  , player_id
+  , HR 
+  , team_HR 
+  , ROUND(HR / team_HR, 3) AS perc_team_HR 
+  FROM joined_data
+)
+
+, final_data AS (
+  SELECT 
+    fdp.season 
+  , fdp.dow 
+  , fdp.dow_int
+  , fdp.team_id 
+  , fdp.player_id
+  , t.abbrev 
+  , t.name AS team_name 
+  , p.name 
+  , fdp.HR 
+  , fdp.team_HR 
+  , fdp.perc_team_HR
+  , ROW_NUMBER() OVER(PARTITION BY fdp.season, fdp.dow, fdp.team_id ORDER BY fdp.perc_team_HR DESC, p.name) AS r 
+  FROM final_data_prep fdp
+  LEFT JOIN mlb_data.players p 
+    ON fdp.player_id = p.id
+  LEFT JOIN mlb_data.teams t 
+    ON fdp.team_id = t.id
+)
+
+SELECT 
+  season 
+, abbrev
+, team_name 
+, dow 
+, name 
+, HR
+, team_HR 
+, perc_team_HR
+FROM final_data 
+WHERE 1=1
+      AND r = 1
+ORDER BY season, abbrev, team_name, dow_int, r ASC
+
